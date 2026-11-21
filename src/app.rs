@@ -1,205 +1,344 @@
-//! State machine for Key Ceremony.
-//!
-//! States:
-//!   TypeSelect  — choose generator type
-//!   Configure   — set length parameter
-//!   Result      — view generated key with entropy estimate
-//!   Saved       — view previously saved keys
+//! Drawing, storage and TRNG plumbing for Key Ceremony. All decisions are
+//! made by `keygen_core::Ui`; this file maps keys to it, carries out its
+//! effects, and draws its state.
 
-extern crate alloc;
-use alloc::string::String;
-use alloc::vec::Vec;
-use alloc::format;
+use gam::menu::Point;
+use gam::GlyphStyle;
+use keygen_core::gen::{format_bits, grouped, strength};
+use keygen_core::record::is_record_key;
+use keygen_core::{Effect, Entropy, EntropyError, Input, Kind, Record, Saved, Screen, Ui};
+use precursor_appkit::keys::Key;
+use precursor_appkit::layout::ListState;
+use precursor_appkit::rng::Trng;
+use precursor_appkit::screen::{Screen as Canvas, MARGIN};
+use precursor_appkit::store::Store;
+use zeroize::Zeroizing;
 
-use crate::generators::*;
-use crate::rng::Rng;
-use crate::storage::{SavedKey, Storage};
+/// PDDB dictionary. One key per saved value (`k.<16 hex>`).
+pub const DICT: &str = "keygen.vault";
 
-const KEY_UP: char = '\u{F700}';
-const KEY_DOWN: char = '\u{F701}';
-const KEY_LEFT: char = '\u{F702}';
-const KEY_RIGHT: char = '\u{F703}';
-const KEY_ENTER: char = '\u{000D}';
-const KEY_BACKSPACE: char = '\u{0008}';
-const KEY_MENU: char = '\u{2234}';
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AppState {
-    TypeSelect,
-    Configure,
-    Result,
-    Saved,
+#[derive(PartialEq, Eq)]
+pub enum Action {
+    Stay,
+    Leave,
 }
 
-pub struct KeygenApp {
-    pub state: AppState,
-    pub needs_redraw: bool,
+/// The hardware TRNG as a fallible core entropy source. An IPC error becomes
+/// `EntropyError` and the core discards the whole value.
+struct TrngSource<'a>(&'a Trng);
 
-    // Type selection
-    pub type_cursor: usize,
-    pub selected_type: GenType,
-
-    // Configuration
-    pub length: usize,
-
-    // Generated result
-    pub result_value: String,
-    pub result_entropy: u32,
-
-    // Saved keys
-    pub saved: Vec<SavedKey>,
-    pub saved_cursor: usize,
-
-    // Storage
-    storage: Option<Storage>,
+impl Entropy for TrngSource<'_> {
+    fn try_u32(&mut self) -> Result<u32, EntropyError> { self.0.try_u32().map_err(|_| EntropyError) }
 }
 
-impl KeygenApp {
-    pub fn new() -> Self {
-        Self {
-            state: AppState::TypeSelect,
-            needs_redraw: true,
-            type_cursor: 0,
-            selected_type: GenType::Password,
-            length: 16,
-            result_value: String::new(),
-            result_entropy: 0,
-            saved: Vec::new(),
-            saved_cursor: 0,
-            storage: None,
+pub struct App {
+    canvas: Canvas,
+    store: Store,
+    trng: Trng,
+    health_conn: trng::Trng,
+    health: String,
+    ui: Ui,
+    types_list: ListState,
+    saved_list: ListState,
+    visible_rows: usize,
+}
+
+fn to_input(key: Key) -> Input {
+    match key {
+        Key::Up => Input::Up,
+        Key::Down => Input::Down,
+        Key::Left => Input::Left,
+        Key::Right => Input::Right,
+        Key::Enter => Input::Enter,
+        Key::Backspace => Input::Backspace,
+        Key::F(n) => Input::F(n),
+        Key::Char(c) => Input::Char(c),
+    }
+}
+
+/// Summarise the TRNG server's error counters for the configure screen.
+fn trng_health(t: &trng::Trng) -> String {
+    match t.get_error_stats() {
+        Ok(e) => {
+            let n = e.excursion_errs.iter().filter(|x| x.is_some()).count() as u32
+                + [e.av_repcount_errs, e.av_adaptive_errs, e.ro_repcount_errs, e.ro_adaptive_errs]
+                    .iter()
+                    .map(|x| x.unwrap_or(0) as u32)
+                    .sum::<u32>()
+                + e.nist_errs;
+            if n == 0 {
+                "TRNG health: no errors logged".into()
+            } else {
+                format!("TRNG health: {n} errors logged since boot")
+            }
         }
+        Err(_) => "TRNG health: unavailable".into(),
+    }
+}
+
+impl App {
+    pub fn new(xns: &xous_names::XousNames, canvas: Canvas, store: Store) -> Self {
+        let trng = Trng::new(xns).expect("can't connect to TRNG");
+        let health_conn = trng::Trng::new(xns).expect("can't connect to TRNG");
+        let health = trng_health(&health_conn);
+        let mut app = Self {
+            canvas,
+            store,
+            trng,
+            health_conn,
+            health,
+            ui: Ui::new(),
+            types_list: ListState::default(),
+            saved_list: ListState::default(),
+            visible_rows: 1,
+        };
+        app.reload();
+        app
     }
 
-    pub fn init_storage(&mut self) {
-        if let Ok(mut st) = Storage::new() {
-            self.saved = st.load_saved();
-            self.storage = Some(st);
-        }
-    }
+    pub fn screen(&self) -> &Canvas { &self.canvas }
 
-    pub fn save_state(&mut self) {
-        if let Some(ref mut st) = self.storage {
-            st.save_keys(&self.saved);
-        }
-    }
+    pub fn needs_tick(&self) -> bool { self.ui.showing_secret() }
 
-    pub fn handle_key(&mut self, key: char, rng: &Rng) -> bool {
-        self.needs_redraw = true;
-        match self.state {
-            AppState::TypeSelect => self.handle_type_select(key),
-            AppState::Configure => self.handle_configure(key, rng),
-            AppState::Result => self.handle_result(key, rng),
-            AppState::Saved => self.handle_saved(key),
-        }
-    }
-
-    fn handle_type_select(&mut self, key: char) -> bool {
-        let types = GenType::all();
-        match key {
-            KEY_MENU => return false,
-            KEY_UP => {
-                if self.type_cursor > 0 {
-                    self.type_cursor -= 1;
-                }
-            }
-            KEY_DOWN => {
-                if self.type_cursor < types.len() - 1 {
-                    self.type_cursor += 1;
-                }
-            }
-            KEY_ENTER => {
-                self.selected_type = types[self.type_cursor];
-                self.length = self.selected_type.default_length();
-                self.state = AppState::Configure;
-            }
-            's' | 'S' => {
-                self.saved_cursor = 0;
-                self.state = AppState::Saved;
-            }
-            _ => {}
-        }
-        true
-    }
-
-    fn handle_configure(&mut self, key: char, rng: &Rng) -> bool {
-        match key {
-            KEY_MENU => {
-                self.state = AppState::TypeSelect;
-            }
-            KEY_LEFT => {
-                let min = self.selected_type.min_length();
-                if self.length > min {
-                    self.length -= 1;
-                }
-            }
-            KEY_RIGHT => {
-                let max = self.selected_type.max_length();
-                if self.length < max {
-                    self.length += 1;
-                }
-            }
-            KEY_ENTER | ' ' => {
-                self.result_value = generate(rng, self.selected_type, self.length);
-                self.result_entropy = entropy_display(self.selected_type, self.length);
-                self.state = AppState::Result;
-            }
-            _ => {}
-        }
-        true
-    }
-
-    fn handle_result(&mut self, key: char, rng: &Rng) -> bool {
-        match key {
-            KEY_MENU | KEY_LEFT => {
-                self.state = AppState::TypeSelect;
-            }
-            'r' | 'R' | ' ' => {
-                // Regenerate
-                self.result_value = generate(rng, self.selected_type, self.length);
-                self.result_entropy = entropy_display(self.selected_type, self.length);
-            }
-            's' | 'S' => {
-                // Save
-                let saved_key = SavedKey {
-                    gen_type: String::from(self.selected_type.label()),
-                    length: self.length,
-                    entropy_bits: self.result_entropy,
-                    value: self.result_value.clone(),
-                };
-                self.saved.push(saved_key);
-                self.save_state();
-            }
-            _ => {}
-        }
-        true
-    }
-
-    fn handle_saved(&mut self, key: char) -> bool {
-        match key {
-            KEY_MENU | KEY_LEFT => {
-                self.state = AppState::TypeSelect;
-            }
-            KEY_UP => {
-                if self.saved_cursor > 0 {
-                    self.saved_cursor -= 1;
-                }
-            }
-            KEY_DOWN => {
-                if !self.saved.is_empty() && self.saved_cursor < self.saved.len() - 1 {
-                    self.saved_cursor += 1;
-                }
-            }
-            'd' | 'D' => {
-                if self.saved_cursor < self.saved.len() {
-                    self.saved.remove(self.saved_cursor);
-                    if self.saved_cursor > 0 && self.saved_cursor >= self.saved.len() {
-                        self.saved_cursor = self.saved.len().saturating_sub(1);
+    /// (Re)load saved keys. Runs at start and whenever a basis is locked or
+    /// unlocked, so nothing from a just-locked basis stays in memory or on screen.
+    pub fn reload(&mut self) {
+        let mut saved = Vec::new();
+        let mut unreadable = 0;
+        match self.store.keys() {
+            Ok(names) => {
+                for name in names.into_iter().filter(|n| is_record_key(n)) {
+                    match self.store.read_bytes(&name) {
+                        Ok(Some(bytes)) => {
+                            let bytes = Zeroizing::new(bytes);
+                            match Record::parse(&bytes) {
+                                Ok(record) => saved.push(Saved { key: name, record }),
+                                Err(e) => {
+                                    log::warn!("record {} unreadable: {:?}", name, e);
+                                    unreadable += 1;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::warn!("couldn't read {}: {:?}", name, e);
+                            unreadable += 1;
+                        }
                     }
-                    self.save_state();
                 }
             }
-            _ => {}
+            Err(e) => {
+                log::error!("couldn't list keys: {:?}", e);
+                self.ui.status = "Couldn't read saved keys".into();
+            }
         }
-        true
+        self.ui.set_saved(saved, unreadable);
+        self.draw();
+    }
+
+    pub fn on_key(&mut self, key: Key) -> Action {
+        let effect = self.ui.on_key(to_input(key), &mut TrngSource(&self.trng));
+        match effect {
+            Effect::None => {}
+            Effect::Leave => return Action::Leave,
+            Effect::Save(key, record) => self.save(key, record),
+            Effect::Delete(key) => match self.store.delete(&key) {
+                Ok(()) => self.ui.on_deleted(&key),
+                Err(e) => {
+                    log::error!("delete failed: {:?}", e);
+                    self.ui.on_delete_failed(&e.kind().to_string());
+                }
+            },
+        }
+        if self.ui.screen == Screen::Configure {
+            self.health = trng_health(&self.health_conn);
+        }
+        Action::Stay
+    }
+
+    fn save(&mut self, key: String, record: Record) {
+        let bytes = match serde_json::to_vec(&record) {
+            Ok(b) => Zeroizing::new(b),
+            Err(_) => {
+                self.ui.on_save_failed("encoding");
+                return;
+            }
+        };
+        match self.store.write_bytes(&key, &bytes) {
+            Ok(()) => {
+                let basis = self.store.basis_of(&key).ok().flatten();
+                self.ui.on_saved(key, record, basis.as_deref());
+            }
+            Err(e) => {
+                log::error!("save failed: {:?}", e.kind());
+                self.ui.on_save_failed(&e.kind().to_string());
+            }
+        }
+    }
+
+    pub fn on_tick(&mut self) {
+        let hid = self.ui.on_tick();
+        if hid || self.ui.seconds_left() % 10 == 0 {
+            self.draw();
+        }
+    }
+
+    pub fn on_foreground(&mut self) {
+        self.canvas.refresh_size();
+        self.health = trng_health(&self.health_conn);
+        self.draw();
+    }
+
+    /// Take secrets off the display when another app comes to the front.
+    pub fn on_background(&mut self) { self.ui.on_background(); }
+
+    fn footer_and_status(&self, hint: &str) -> isize {
+        let bottom = self.canvas.footer(hint);
+        if self.ui.status.is_empty() {
+            return bottom;
+        }
+        let h = self.canvas.line_height(GlyphStyle::Small);
+        self.canvas.text(bottom - h, GlyphStyle::Small, &self.ui.status);
+        bottom - h
+    }
+
+    /// The value as it should be read: hex/base64 in groups of 4, mnemonic
+    /// words numbered.
+    fn display_value(kind: Kind, value: &str) -> Zeroizing<String> {
+        match kind {
+            Kind::HexKey | Kind::Base64Key => grouped(value, 4),
+            Kind::Mnemonic => {
+                let mut s = Zeroizing::new(String::with_capacity(value.len() + 72));
+                for (i, w) in value.split(' ').enumerate() {
+                    if i > 0 {
+                        s.push_str("  ");
+                    }
+                    s.push_str(&format!("{}.{}", i + 1, w));
+                }
+                s
+            }
+            _ => {
+                let mut s = Zeroizing::new(String::with_capacity(value.len()));
+                s.push_str(value);
+                s
+            }
+        }
+    }
+
+    fn draw_value(&self, top: isize, bottom: isize, kind: Kind, value: &str) -> isize {
+        let shown = Self::display_value(kind, value);
+        let w = self.canvas.size().x;
+        let used = self.canvas.text_in(Point::new(MARGIN, top), Point::new(w - MARGIN, bottom), GlyphStyle::Monospace, &shown);
+        top + used + 6
+    }
+
+    pub fn draw(&mut self) {
+        self.canvas.clear();
+        match self.ui.screen {
+            Screen::Types => self.draw_types(),
+            Screen::Configure => self.draw_configure(),
+            Screen::Result => self.draw_result(),
+            Screen::Label => self.draw_label(),
+            Screen::Saved => self.draw_saved(),
+            Screen::View => self.draw_view(),
+            Screen::ConfirmDelete => self.draw_confirm(),
+        }
+        self.canvas.flush();
+    }
+
+    fn draw_types(&mut self) {
+        let top = self.canvas.header("Key Ceremony");
+        let bottom = self.footer_and_status("↑↓ move · ⏎ select · S saved · ⌫ quit");
+        let labels: Vec<&str> = Kind::ALL.iter().map(|k| k.label()).collect();
+        self.types_list.selected = self.ui.type_cursor;
+        self.types_list.clamp(labels.len(), self.visible_rows);
+        self.visible_rows = self.canvas.list(top, bottom, &labels, &self.types_list).max(1);
+    }
+
+    fn draw_configure(&self) {
+        let k = self.ui.kind;
+        let mut y = self.canvas.header(k.label());
+        let bottom = self.footer_and_status("←→ length · ⏎ generate · ⌫ back");
+        let t = self.ui.entropy_tenths();
+        y += self.canvas.text(y, GlyphStyle::Small, k.description());
+        y += 6;
+        y += self.canvas.text(y, GlyphStyle::Regular, &format!("Length: {} {}", self.ui.length, k.unit()));
+        y += self.canvas.text(y, GlyphStyle::Regular, &format!("Entropy: {}", format_bits(t)));
+        y += self.canvas.text(y, GlyphStyle::Regular, &format!("Strength: {}", strength(t)));
+        y += 6;
+        if y < bottom {
+            self.canvas.text(y, GlyphStyle::Small, &self.health);
+        }
+    }
+
+    fn draw_result(&self) {
+        let k = self.ui.kind;
+        let top = self.canvas.header(&format!("{} · {} {}", k.label(), self.ui.length, k.unit()));
+        let bottom = self.footer_and_status("R new · S save · ⌫ back");
+        let Some(v) = self.ui.current.as_ref() else { return };
+        let t = self.ui.entropy_tenths();
+        let mut y = self.draw_value(top, bottom - 60, k, v.expose());
+        y += self.canvas.text(y, GlyphStyle::Small, &format!("{} · {}", format_bits(t), strength(t)));
+        self.canvas.text(y, GlyphStyle::Small, &format!("Hides in about {} s", self.ui.seconds_left()));
+    }
+
+    fn draw_label(&self) {
+        let mut y = self.canvas.header("Save to vault");
+        self.footer_and_status("⏎ save · F4 cancel");
+        y += self.canvas.text(y, GlyphStyle::Regular, "Label (optional):");
+        let mut line = Zeroizing::new(self.ui.label.clone());
+        line.push('_');
+        y += self.canvas.text(y, GlyphStyle::Regular, &line);
+        y += 6;
+        let basis = self.store.target_basis().unwrap_or_else(|| "?".into());
+        self.canvas.text(y, GlyphStyle::Small, &format!("New keys go to basis: {basis}"));
+    }
+
+    fn draw_saved(&mut self) {
+        let n = self.ui.saved.len();
+        let top = self.canvas.header(&format!("Saved keys ({n})"));
+        let mut bottom = self.footer_and_status("⏎ view · D delete · ⌫ back");
+        if self.ui.unreadable > 0 {
+            let h = self.canvas.line_height(GlyphStyle::Small);
+            self.canvas.text(bottom - h, GlyphStyle::Small, &format!("{} unreadable record(s) left untouched", self.ui.unreadable));
+            bottom -= h;
+        }
+        if n == 0 {
+            self.canvas.text(top + 10, GlyphStyle::Regular, "No saved keys. Generate one and press S.");
+            return;
+        }
+        let labels: Vec<String> = self
+            .ui
+            .saved
+            .iter()
+            .map(|s| format!("{} · {}", s.record.title(), format_bits(s.record.bits_tenths)))
+            .collect();
+        self.saved_list.selected = self.ui.saved_cursor;
+        self.saved_list.clamp(n, self.visible_rows);
+        self.visible_rows = self.canvas.list(top, bottom, &labels, &self.saved_list).max(1);
+    }
+
+    fn draw_view(&self) {
+        let Some(s) = self.ui.selected() else { return };
+        let r = &s.record;
+        let mut y = self.canvas.header(&r.title());
+        let bottom = self.footer_and_status("D delete · ⌫ back");
+        y += self.canvas.text(
+            y,
+            GlyphStyle::Small,
+            &format!("{} · {} {} · {}", r.kind.label(), r.length, r.kind.unit(), format_bits(r.bits_tenths)),
+        );
+        let y = self.draw_value(y + 4, bottom - 30, r.kind, r.value.expose());
+        self.canvas.text(y, GlyphStyle::Small, &format!("Hides in about {} s", self.ui.seconds_left()));
+    }
+
+    fn draw_confirm(&self) {
+        let Some(s) = self.ui.selected() else { return };
+        let mut y = self.canvas.header("Delete saved key?");
+        self.footer_and_status("Y delete · any other key cancels");
+        y += self.canvas.text(y, GlyphStyle::Regular, &s.record.title());
+        y += 6;
+        let note = "Removes the PDDB key. Old flash pages are not overwritten immediately.";
+        self.canvas.text_in(Point::new(MARGIN, y), Point::new(self.canvas.size().x - MARGIN, y + 80), GlyphStyle::Small, note);
     }
 }

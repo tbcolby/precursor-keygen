@@ -1,6 +1,6 @@
 /target
 Cargo.lock
+screenshots/
 *.swp
-*.swo
 *~
 .DS_Store
