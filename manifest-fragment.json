@@ -1,0 +1,11 @@
+{
+    "keygen": {
+        "context_name": "Key Ceremony",
+        "menu_name": {
+            "appmenu.keygen": {
+                "en": "Key Ceremony",
+                "en-tts": "Key Ceremony"
+            }
+        }
+    }
+}

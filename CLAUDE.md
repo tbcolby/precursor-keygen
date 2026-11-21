@@ -1,18 +1,20 @@
 # Key Ceremony — Build Notes
 
 ## Architecture
-- 4-state machine: TypeSelect, Configure, Result, Saved
-- 6 generator types with configurable length
-- Entropy estimation using integer math (no float)
-- ~630-word dictionary for Diceware passphrases
+- `core/` (`keygen-core`, no Xous deps, host-tested): generators, exact
+  entropy accounting, BIP-39, saved-record format, and the screen state
+  machine (`Ui`, which returns `Effect`s for storage and leaving).
+- `src/main.rs` routes GAM messages (template pattern); `src/app.rs` maps
+  keys to `Ui`, performs effects via `appkit::store::Store`, draws via
+  `appkit::screen::Screen`.
+- Entropy source: `appkit::rng::Trng::try_u32` behind the core `Entropy`
+  trait. A failed draw aborts the whole value (fail closed).
+- Secrets are `keygen_core::Secret` (wiped on drop, redacted `Debug`).
+- One PDDB key per saved value (`keygen.vault` / `k.<16 hex>`), so delete
+  removes the key and each record stays in its own basis.
 
-## Key Patterns
-**Generator dispatch** — generate() dispatches to type-specific functions
-**Entropy without float** — approximate bits/unit as integers (6 bits/char for passwords, etc.)
-**Guaranteed diversity** — passwords ensure at least one of each char class, then shuffle
-**Diceware dictionary** — compact 4-letter word list embedded in binary
-
-## Build
+## Test / gate
 ```bash
-cargo build -p keygen --target riscv32imac-unknown-xous-elf
+cd core && cargo test
+cd ../xous-dev-toolkit && bin/integrate --xous-root <xous-core> --grade -v ../precursor-keygen
 ```
